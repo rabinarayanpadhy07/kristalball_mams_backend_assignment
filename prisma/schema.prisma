@@ -1,0 +1,644 @@
+// Military Asset Management System — relational schema (MySQL 8).
+//
+// Design notes (see docs/ARCHITECTURE.md for the full rationale):
+// - `InventoryMovement` is the append-only stock ledger and the source of truth for
+//   opening/closing balances. `Inventory` is a projection of it (current on-hand and
+//   assigned quantities per base × equipment), updated in the same DB transaction.
+// - Equipment is either SERIALIZED (each unit is an `Asset` row with a serial number)
+//   or QUANTITY-tracked (consumables / bulk items counted only in `Inventory`).
+// - Assignments never write ledger rows: an assigned item still exists. They only move
+//   quantity between "available" and "assigned" inside `Inventory`.
+// - Posted transactions are never edited or deleted; corrections are reversal rows.
+//   CHECK constraints and immutability triggers live in the
+//   `*_integrity_constraints` migration because Prisma cannot express them.
+// - Every relation is ON DELETE RESTRICT / ON UPDATE RESTRICT: history must never be
+//   orphaned or silently rewritten, and MySQL forbids CHECKs on columns that carry
+//   cascading FK actions.
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "ts"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum RoleCode {
+  ADMIN
+  BASE_COMMANDER
+  LOGISTICS_OFFICER
+}
+
+enum TrackingType {
+  SERIALIZED // one Asset row per physical unit
+  QUANTITY // counted in bulk (ammunition, fuel, batteries, …)
+}
+
+enum UnitOfMeasure {
+  UNIT
+  ROUND
+  BOX
+  LITRE
+  KILOGRAM
+}
+
+enum AssetStatus {
+  AVAILABLE
+  ASSIGNED
+  EXPENDED
+}
+
+enum MovementType {
+  PURCHASE
+  TRANSFER_IN
+  TRANSFER_OUT
+  EXPENDITURE
+  ADJUSTMENT
+}
+
+enum PurchaseStatus {
+  POSTED
+  VOIDED
+}
+
+enum TransferStatus {
+  PENDING // requested; no stock has moved yet
+  COMPLETED // stock moved (terminal)
+  CANCELLED // withdrawn before completion; no stock ever moved (terminal)
+}
+
+enum AssignmentStatus {
+  ACTIVE // some quantity still outstanding with the assignee
+  RETURNED // everything came back
+  CLOSED // settled, with at least part expended while assigned
+}
+
+enum ReturnCondition {
+  SERVICEABLE
+  UNSERVICEABLE
+}
+
+enum ExpenditureStatus {
+  POSTED
+  VOIDED
+}
+
+enum ExpenditureReason {
+  TRAINING
+  OPERATION
+  MAINTENANCE
+  DAMAGED
+  LOST
+  OTHER
+}
+
+enum AdjustmentReason {
+  OPENING_STOCK
+  STOCKTAKE_CORRECTION
+  OTHER
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Identity & access
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Role {
+  id          Int      @id @default(autoincrement())
+  code        RoleCode @unique
+  name        String   @db.VarChar(100)
+  description String?  @db.VarChar(500)
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  users User[]
+
+  @@map("roles")
+}
+
+model User {
+  id                Int       @id @default(autoincrement())
+  email             String    @unique @db.VarChar(191)
+  fullName          String    @map("full_name") @db.VarChar(150)
+  serviceNumber     String?   @unique @map("service_number") @db.VarChar(50)
+  /// bcrypt hash. Plaintext passwords are never stored or logged.
+  passwordHash      String    @map("password_hash") @db.VarChar(255)
+  roleId            Int       @map("role_id")
+  /// Required for BASE_COMMANDER and LOGISTICS_OFFICER, null for ADMIN (enforced in the service layer).
+  baseId            Int?      @map("base_id")
+  isActive          Boolean   @default(true) @map("is_active")
+  /// Embedded in access tokens; bump to invalidate all sessions (role/base change, deactivation, password change).
+  tokenVersion      Int       @default(0) @map("token_version")
+  failedLoginCount  Int       @default(0) @map("failed_login_count")
+  lockedUntil       DateTime? @map("locked_until") @db.DateTime(3)
+  lastLoginAt       DateTime? @map("last_login_at") @db.DateTime(3)
+  passwordChangedAt DateTime? @map("password_changed_at") @db.DateTime(3)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+
+  role Role  @relation(fields: [roleId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  base Base? @relation(fields: [baseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  refreshTokens       RefreshToken[]
+  idempotencyKeys     IdempotencyKey[]
+  movementsCreated    InventoryMovement[]
+  purchasesCreated    Purchase[]          @relation("PurchaseCreatedBy")
+  purchasesVoided     Purchase[]          @relation("PurchaseVoidedBy")
+  transfersCreated    Transfer[]          @relation("TransferCreatedBy")
+  transfersCompleted  Transfer[]          @relation("TransferCompletedBy")
+  transfersCancelled  Transfer[]          @relation("TransferCancelledBy")
+  assignmentsCreated  Assignment[]
+  assignmentReturns   AssignmentReturn[]
+  expendituresCreated Expenditure[]       @relation("ExpenditureCreatedBy")
+  expendituresVoided  Expenditure[]       @relation("ExpenditureVoidedBy")
+  adjustmentsCreated  StockAdjustment[]
+  auditLogs           AuditLog[]
+
+  @@index([roleId])
+  @@index([baseId])
+  @@map("users")
+}
+
+model RefreshToken {
+  id                Int       @id @default(autoincrement())
+  userId            Int       @map("user_id")
+  /// SHA-256 of the opaque token; the raw token only ever lives in the httpOnly cookie.
+  tokenHash         String    @unique @map("token_hash") @db.Char(64)
+  /// All tokens produced by rotating one login share a family; reuse of a revoked token revokes the family.
+  familyId          String    @map("family_id") @db.Char(36)
+  expiresAt         DateTime  @map("expires_at") @db.DateTime(3)
+  revokedAt         DateTime? @map("revoked_at") @db.DateTime(3)
+  replacedByTokenId Int?      @map("replaced_by_token_id")
+  createdByIp       String?   @map("created_by_ip") @db.VarChar(45)
+  userAgent         String?   @map("user_agent") @db.VarChar(512)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+model IdempotencyKey {
+  id             Int      @id @default(autoincrement())
+  userId         Int      @map("user_id")
+  key            String   @db.VarChar(100)
+  method         String   @db.VarChar(10)
+  path           String   @db.VarChar(255)
+  /// SHA-256 of the request body; the same key with a different body is rejected.
+  requestHash    String   @map("request_hash") @db.Char(64)
+  responseStatus Int?     @map("response_status")
+  responseBody   Json?    @map("response_body")
+  expiresAt      DateTime @map("expires_at") @db.DateTime(3)
+  createdAt      DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([userId, key])
+  @@index([expiresAt])
+  @@map("idempotency_keys")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Master data
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Base {
+  id        Int      @id @default(autoincrement())
+  code      String   @unique @db.VarChar(20)
+  name      String   @unique @db.VarChar(150)
+  location  String?  @db.VarChar(255)
+  /// Bases are deactivated, never deleted: history references them.
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  users        User[]
+  inventory    Inventory[]
+  movements    InventoryMovement[]
+  assets       Asset[]
+  purchases    Purchase[]
+  transfersOut Transfer[]          @relation("TransferFromBase")
+  transfersIn  Transfer[]          @relation("TransferToBase")
+  assignments  Assignment[]
+  expenditures Expenditure[]
+  adjustments  StockAdjustment[]
+  auditLogs    AuditLog[]
+
+  @@map("bases")
+}
+
+model EquipmentType {
+  id          Int      @id @default(autoincrement())
+  code        String   @unique @db.VarChar(20)
+  name        String   @unique @db.VarChar(100)
+  description String?  @db.VarChar(500)
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  equipment Equipment[]
+
+  @@map("equipment_types")
+}
+
+/// A catalog item (e.g. "M4A1 Carbine", "5.56mm Ball M855A1"), not a physical unit.
+model Equipment {
+  id              Int           @id @default(autoincrement())
+  equipmentTypeId Int           @map("equipment_type_id")
+  code            String        @unique @db.VarChar(40)
+  name            String        @db.VarChar(150)
+  /// Immutable once any stock exists: changing it would invalidate Asset/Inventory consistency.
+  trackingType    TrackingType  @map("tracking_type")
+  unitOfMeasure   UnitOfMeasure @default(UNIT) @map("unit_of_measure")
+  description     String?       @db.VarChar(500)
+  isActive        Boolean       @default(true) @map("is_active")
+  createdAt       DateTime      @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime      @updatedAt @map("updated_at") @db.DateTime(3)
+
+  equipmentType EquipmentType @relation(fields: [equipmentTypeId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  inventory    Inventory[]
+  movements    InventoryMovement[]
+  assets       Asset[]
+  purchases    Purchase[]
+  transfers    Transfer[]
+  assignments  Assignment[]
+  expenditures Expenditure[]
+  adjustments  StockAdjustment[]
+
+  @@unique([equipmentTypeId, name])
+  @@index([trackingType])
+  @@map("equipment")
+}
+
+/// One physical, serial-numbered unit of SERIALIZED equipment.
+model Asset {
+  id            Int         @id @default(autoincrement())
+  equipmentId   Int         @map("equipment_id")
+  serialNumber  String      @map("serial_number") @db.VarChar(100)
+  /// Where the unit physically is (or was, when EXPENDED).
+  currentBaseId Int         @map("current_base_id")
+  status        AssetStatus @default(AVAILABLE)
+  notes         String?     @db.VarChar(500)
+  createdAt     DateTime    @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt     DateTime    @updatedAt @map("updated_at") @db.DateTime(3)
+
+  equipment   Equipment @relation(fields: [equipmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  currentBase Base      @relation(fields: [currentBaseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  movements     InventoryMovement[]
+  assignments   Assignment[]
+  expenditures  Expenditure[]
+  transferItems TransferAsset[]
+
+  @@unique([equipmentId, serialNumber])
+  @@index([currentBaseId, equipmentId, status])
+  @@map("assets")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inventory
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Current stock per base × equipment. A projection of `InventoryMovement` (on-hand)
+/// plus open assignments (assigned). available = quantityOnHand - quantityAssigned.
+model Inventory {
+  id               Int      @id @default(autoincrement())
+  baseId           Int      @map("base_id")
+  equipmentId      Int      @map("equipment_id")
+  quantityOnHand   Int      @default(0) @map("quantity_on_hand")
+  quantityAssigned Int      @default(0) @map("quantity_assigned")
+  /// Incremented on every change; useful for optimistic checks and debugging drift.
+  version          Int      @default(0)
+  createdAt        DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  base      Base      @relation(fields: [baseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  equipment Equipment @relation(fields: [equipmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([baseId, equipmentId])
+  @@index([equipmentId])
+  @@map("inventory")
+}
+
+/// Append-only stock ledger. Exactly one source document per row.
+/// Opening(period) = Σ quantityDelta before `from`; Closing = Σ quantityDelta up to `to`.
+model InventoryMovement {
+  id            Int          @id @default(autoincrement())
+  baseId        Int          @map("base_id")
+  equipmentId   Int          @map("equipment_id")
+  /// Set for SERIALIZED equipment: one row per unit, quantityDelta = ±1.
+  assetId       Int?         @map("asset_id")
+  type          MovementType
+  /// Signed: positive adds stock at `baseId`, negative removes it.
+  quantityDelta Int          @map("quantity_delta")
+  /// Business date of the event (drives reporting); `createdAt` is when it was recorded.
+  occurredAt    DateTime     @map("occurred_at") @db.DateTime(3)
+  /// True for compensating rows written by a void/cancel (same type, opposite sign).
+  isReversal    Boolean      @default(false) @map("is_reversal")
+  purchaseId    Int?         @map("purchase_id")
+  transferId    Int?         @map("transfer_id")
+  expenditureId Int?         @map("expenditure_id")
+  adjustmentId  Int?         @map("adjustment_id")
+  createdById   Int          @map("created_by_id")
+  createdAt     DateTime     @default(now()) @map("created_at") @db.DateTime(3)
+
+  base        Base             @relation(fields: [baseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  equipment   Equipment        @relation(fields: [equipmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  asset       Asset?           @relation(fields: [assetId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  purchase    Purchase?        @relation(fields: [purchaseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  transfer    Transfer?        @relation(fields: [transferId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  expenditure Expenditure?     @relation(fields: [expenditureId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  adjustment  StockAdjustment? @relation(fields: [adjustmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  createdBy   User             @relation(fields: [createdById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  // Covering indexes for dashboard aggregation (SUM(quantity_delta) by type over a
+  // date range): each serves one filter shape index-only, without touching the table.
+  @@index([baseId, equipmentId, occurredAt, type, quantityDelta], map: "idx_movements_base_equip_time_cov")
+  @@index([baseId, occurredAt, type, equipmentId, quantityDelta], map: "idx_movements_base_time_cov")
+  @@index([equipmentId, occurredAt, type, baseId, quantityDelta], map: "idx_movements_equip_time_cov")
+  @@index([occurredAt, type, baseId, equipmentId, quantityDelta], map: "idx_movements_time_cov")
+  @@index([assetId, occurredAt])
+  @@index([purchaseId])
+  @@index([transferId])
+  @@index([expenditureId])
+  @@index([adjustmentId])
+  @@index([createdById])
+  @@map("inventory_movements")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Business transactions
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Purchase {
+  id              Int            @id @default(autoincrement())
+  /// Human-readable, e.g. PUR-2026-000042. Assigned from `id` inside the creating transaction.
+  referenceNo     String?        @unique @map("reference_no") @db.VarChar(30)
+  baseId          Int            @map("base_id")
+  equipmentId     Int            @map("equipment_id")
+  quantity        Int
+  unitCost        Decimal?       @map("unit_cost") @db.Decimal(14, 2)
+  supplierName    String?        @map("supplier_name") @db.VarChar(191)
+  purchaseOrderNo String?        @map("purchase_order_no") @db.VarChar(50)
+  purchasedAt     DateTime       @map("purchased_at") @db.DateTime(3)
+  notes           String?        @db.Text
+  status          PurchaseStatus @default(POSTED)
+  createdById     Int            @map("created_by_id")
+  voidedById      Int?           @map("voided_by_id")
+  voidedAt        DateTime?      @map("voided_at") @db.DateTime(3)
+  voidReason      String?        @map("void_reason") @db.VarChar(500)
+  createdAt       DateTime       @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime       @updatedAt @map("updated_at") @db.DateTime(3)
+
+  base      Base      @relation(fields: [baseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  equipment Equipment @relation(fields: [equipmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  createdBy User      @relation("PurchaseCreatedBy", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  voidedBy  User?     @relation("PurchaseVoidedBy", fields: [voidedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  movements InventoryMovement[]
+
+  @@index([baseId, purchasedAt])
+  @@index([equipmentId, purchasedAt])
+  @@index([purchasedAt])
+  @@index([status])
+  @@index([createdById])
+  @@index([voidedById])
+  @@map("purchases")
+}
+
+/// Two-step workflow: PENDING → COMPLETED | CANCELLED.
+/// Creating a transfer moves nothing. Completing it writes TRANSFER_OUT at the source
+/// and TRANSFER_IN at the destination, both Inventory updates and the status change
+/// in one DB transaction. Only PENDING rows may change (enforced by trigger).
+model Transfer {
+  id                Int            @id @default(autoincrement())
+  referenceNo       String?        @unique @map("reference_no") @db.VarChar(30)
+  sourceBaseId      Int            @map("from_base_id")
+  destinationBaseId Int            @map("to_base_id")
+  equipmentId       Int            @map("equipment_id")
+  quantity          Int
+  notes             String?        @db.Text
+  status            TransferStatus @default(PENDING)
+  createdById       Int            @map("created_by_id")
+  /// Business date of the stock movement; the ledger rows carry the same `occurredAt`.
+  completedAt       DateTime?      @map("completed_at") @db.DateTime(3)
+  completedById     Int?           @map("completed_by_id")
+  cancelledById     Int?           @map("cancelled_by_id")
+  cancelledAt       DateTime?      @map("cancelled_at") @db.DateTime(3)
+  cancelReason      String?        @map("cancel_reason") @db.VarChar(500)
+  createdAt         DateTime       @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt         DateTime       @updatedAt @map("updated_at") @db.DateTime(3)
+
+  sourceBase      Base      @relation("TransferFromBase", fields: [sourceBaseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  destinationBase Base      @relation("TransferToBase", fields: [destinationBaseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  equipment       Equipment @relation(fields: [equipmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  createdBy       User      @relation("TransferCreatedBy", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  completedBy     User?     @relation("TransferCompletedBy", fields: [completedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  cancelledBy     User?     @relation("TransferCancelledBy", fields: [cancelledById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  movements InventoryMovement[]
+  assets    TransferAsset[]
+
+  @@index([sourceBaseId, createdAt])
+  @@index([destinationBaseId, createdAt])
+  @@index([equipmentId, createdAt])
+  @@index([status, createdAt])
+  @@index([createdAt])
+  @@index([createdById])
+  @@index([completedById])
+  @@index([cancelledById])
+  @@map("transfers")
+}
+
+/// The serial-numbered units named on a SERIALIZED transfer. Fixed when the transfer
+/// is created; the units themselves move only when it completes. Append-only.
+model TransferAsset {
+  id         Int @id @default(autoincrement())
+  transferId Int @map("transfer_id")
+  assetId    Int @map("asset_id")
+
+  transfer Transfer @relation(fields: [transferId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  asset    Asset    @relation(fields: [assetId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([transferId, assetId])
+  @@index([assetId])
+  @@map("transfer_assets")
+}
+
+/// Issues equipment to a person. Does NOT change on-hand stock or the ledger.
+/// outstanding = quantity - quantityReturned - quantityExpended.
+model Assignment {
+  id                Int              @id @default(autoincrement())
+  referenceNo       String?          @unique @map("reference_no") @db.VarChar(30)
+  baseId            Int              @map("base_id")
+  equipmentId       Int              @map("equipment_id")
+  /// Set for SERIALIZED equipment (quantity must then be 1).
+  assetId           Int?             @map("asset_id")
+  quantity          Int
+  quantityReturned  Int              @default(0) @map("quantity_returned")
+  quantityExpended  Int              @default(0) @map("quantity_expended")
+  assigneeName      String           @map("assignee_name") @db.VarChar(150)
+  assigneeServiceNo String           @map("assignee_service_no") @db.VarChar(50)
+  assigneeUnit      String?          @map("assignee_unit") @db.VarChar(150)
+  purpose           String?          @db.VarChar(255)
+  assignedAt        DateTime         @map("assigned_at") @db.DateTime(3)
+  expectedReturnAt  DateTime?        @map("expected_return_at") @db.DateTime(3)
+  closedAt          DateTime?        @map("closed_at") @db.DateTime(3)
+  status            AssignmentStatus @default(ACTIVE)
+  notes             String?          @db.Text
+  createdById       Int              @map("created_by_id")
+  createdAt         DateTime         @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt         DateTime         @updatedAt @map("updated_at") @db.DateTime(3)
+
+  base      Base      @relation(fields: [baseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  equipment Equipment @relation(fields: [equipmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  asset     Asset?    @relation(fields: [assetId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  createdBy User      @relation(fields: [createdById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  returns      AssignmentReturn[]
+  expenditures Expenditure[]
+
+  @@index([baseId, assignedAt])
+  @@index([baseId, status])
+  @@index([equipmentId, assignedAt])
+  @@index([assetId])
+  @@index([assigneeServiceNo])
+  @@index([createdById])
+  @@map("assignments")
+}
+
+/// One row per (partial) return, so assignment history is never overwritten.
+model AssignmentReturn {
+  id           Int             @id @default(autoincrement())
+  assignmentId Int             @map("assignment_id")
+  quantity     Int
+  condition    ReturnCondition @default(SERVICEABLE)
+  returnedAt   DateTime        @map("returned_at") @db.DateTime(3)
+  notes        String?         @db.VarChar(500)
+  receivedById Int             @map("received_by_id")
+  createdAt    DateTime        @default(now()) @map("created_at") @db.DateTime(3)
+
+  assignment Assignment @relation(fields: [assignmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  receivedBy User       @relation(fields: [receivedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([assignmentId])
+  @@index([receivedById])
+  @@map("assignment_returns")
+}
+
+/// Consumes stock (removes it from on-hand). Optionally drawn from an open assignment.
+model Expenditure {
+  id           Int               @id @default(autoincrement())
+  referenceNo  String?           @unique @map("reference_no") @db.VarChar(30)
+  baseId       Int               @map("base_id")
+  equipmentId  Int               @map("equipment_id")
+  /// Set for SERIALIZED equipment (quantity must then be 1).
+  assetId      Int?              @map("asset_id")
+  /// Set when the expended quantity was held by an assignee.
+  assignmentId Int?              @map("assignment_id")
+  quantity     Int
+  reason       ExpenditureReason
+  expendedAt   DateTime          @map("expended_at") @db.DateTime(3)
+  notes        String?           @db.Text
+  status       ExpenditureStatus @default(POSTED)
+  createdById  Int               @map("created_by_id")
+  voidedById   Int?              @map("voided_by_id")
+  voidedAt     DateTime?         @map("voided_at") @db.DateTime(3)
+  voidReason   String?           @map("void_reason") @db.VarChar(500)
+  createdAt    DateTime          @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt    DateTime          @updatedAt @map("updated_at") @db.DateTime(3)
+
+  base       Base        @relation(fields: [baseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  equipment  Equipment   @relation(fields: [equipmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  asset      Asset?      @relation(fields: [assetId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  assignment Assignment? @relation(fields: [assignmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  createdBy  User        @relation("ExpenditureCreatedBy", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  voidedBy   User?       @relation("ExpenditureVoidedBy", fields: [voidedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  movements InventoryMovement[]
+
+  @@index([baseId, expendedAt])
+  @@index([equipmentId, expendedAt])
+  @@index([expendedAt])
+  @@index([assetId])
+  @@index([assignmentId])
+  @@index([status])
+  @@index([createdById])
+  @@index([voidedById])
+  @@map("expenditures")
+}
+
+/// Admin-only stock correction. Also the only way opening stock enters the system.
+model StockAdjustment {
+  id            Int              @id @default(autoincrement())
+  referenceNo   String?          @unique @map("reference_no") @db.VarChar(30)
+  baseId        Int              @map("base_id")
+  equipmentId   Int              @map("equipment_id")
+  quantityDelta Int              @map("quantity_delta")
+  reason        AdjustmentReason
+  occurredAt    DateTime         @map("occurred_at") @db.DateTime(3)
+  notes         String?          @db.Text
+  createdById   Int              @map("created_by_id")
+  createdAt     DateTime         @default(now()) @map("created_at") @db.DateTime(3)
+
+  base      Base      @relation(fields: [baseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  equipment Equipment @relation(fields: [equipmentId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  createdBy User      @relation(fields: [createdById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  movements InventoryMovement[]
+
+  @@index([baseId, occurredAt])
+  @@index([equipmentId, occurredAt])
+  @@index([createdById])
+  @@map("stock_adjustments")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Append-only (UPDATE/DELETE blocked by trigger). Written in the same DB transaction
+/// as the business change it describes. Actor email/role are snapshotted so the trail
+/// stays accurate after a user's role or email changes.
+model AuditLog {
+  id          Int       @id @default(autoincrement())
+  /// Null only for events without an authenticated actor (e.g. failed login for an unknown email).
+  actorUserId Int?      @map("actor_user_id")
+  actorEmail  String?   @map("actor_email") @db.VarChar(191)
+  actorRole   RoleCode? @map("actor_role")
+  /// e.g. PURCHASE_CREATED, TRANSFER_COMPLETED, USER_LOGIN_FAILED
+  action      String    @db.VarChar(64)
+  /// Model name of the affected record, e.g. "Purchase".
+  entityType  String    @map("entity_type") @db.VarChar(64)
+  entityId    String?   @map("entity_id") @db.VarChar(64)
+  /// Base the event belongs to, for base-scoped audit visibility.
+  baseId      Int?      @map("base_id")
+  requestId   String?   @map("request_id") @db.VarChar(64)
+  ipAddress   String?   @map("ip_address") @db.VarChar(45)
+  userAgent   String?   @map("user_agent") @db.VarChar(512)
+  before      Json?
+  after       Json?
+  metadata    Json?
+  createdAt   DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  base  Base? @relation(fields: [baseId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([createdAt])
+  @@index([actorUserId, createdAt])
+  @@index([entityType, entityId])
+  @@index([baseId, createdAt])
+  @@index([action, createdAt])
+  @@index([requestId])
+  @@map("audit_logs")
+}
