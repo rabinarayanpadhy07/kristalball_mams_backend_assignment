@@ -103,7 +103,12 @@ const OPENING_STOCK = {
 // Transfers are raised by `by` and completed (approved) by the source base commander
 // on the same date unless `status` says otherwise.
 
-const PURCHASES = [
+// ─────────────────────────────────────────────────────────────────────────────
+// Operational history. Default is clean operations (empty).
+// Set SEED_OPERATIONS=true in the environment if demo history is ever needed.
+const SEED_OPERATIONS = process.env.SEED_OPERATIONS === 'true';
+
+const PURCHASES = SEED_OPERATIONS ? [
   { at: '2026-07-08T09:30:00Z', by: 'logFTA', base: 'FTA', eq: 'AMM-556', qty: 50000, unitCost: '0.42', supplier: 'Northwind Defense Supply Co.', po: 'PO-FTA-26-0107' },
   { at: '2026-07-15T10:00:00Z', by: 'logCHW', base: 'CHW', eq: 'WPN-M4A1', count: 10, unitCost: '1150.00', supplier: 'Granite Arms Distribution', po: 'PO-CHW-26-0112' },
   { at: '2026-07-22T08:15:00Z', by: 'logKAF', base: 'KAF', eq: 'POL-JP8', qty: 80000, unitCost: '0.95', supplier: 'Ridgeline Fuels Ltd.', po: 'PO-KAF-26-0118' },
@@ -117,9 +122,9 @@ const PURCHASES = [
   { at: '2026-09-16T08:50:00Z', by: 'logCHW', base: 'CHW', eq: 'AMM-M67', qty: 100, unitCost: '48.50', supplier: 'Northwind Defense Supply Co.', po: 'PO-CHW-26-0171' },
   { at: '2026-09-23T15:05:00Z', by: 'logFTA', base: 'FTA', eq: 'MED-CAT', qty: 100, unitCost: '32.00', supplier: 'Caldera Medical Supply', po: 'PO-FTA-26-0178' },
   { at: '2026-09-25T09:15:00Z', by: 'logKAF', base: 'KAF', eq: 'AMM-556', qty: 30000, unitCost: '0.42', supplier: 'Northwind Defense Supply Co.', po: 'PO-KAF-26-0181' },
-];
+] : [];
 
-const TRANSFERS = [
+const TRANSFERS = SEED_OPERATIONS ? [
   { at: '2026-07-10T07:30:00Z', by: 'logFTA', from: 'FTA', to: 'CHW', eq: 'AMM-556', qty: 20000, notes: 'Range allocation for Q3 qualification cycle.' },
   { at: '2026-07-18T08:00:00Z', by: 'cmdrFTA', from: 'FTA', to: 'KAF', eq: 'WPN-M4A1', count: 10, notes: 'Airfield security detachment reinforcement.' },
   { at: '2026-07-29T12:00:00Z', by: 'logKAF', from: 'KAF', to: 'CHW', eq: 'POL-JP8', qty: 25000, notes: 'Bulk fuel redistribution by tanker convoy.' },
@@ -129,13 +134,11 @@ const TRANSFERS = [
   { at: '2026-09-05T11:30:00Z', by: 'logCHW', from: 'CHW', to: 'FTA', eq: 'AMM-M67', qty: 50, notes: 'Replenishment after demolition range.' },
   { at: '2026-09-12T13:15:00Z', by: 'logFTA', from: 'FTA', to: 'KAF', eq: 'MED-IFAK', qty: 60, notes: 'Flight-line medical readiness.' },
   { at: '2026-09-20T07:50:00Z', by: 'cmdrCHW', from: 'CHW', to: 'KAF', eq: 'WPN-M4A1', count: 5, notes: 'Temporary duty weapons for airfield guard force.' },
-  // Requested but not yet approved by the source commander.
   { at: '2026-09-27T10:00:00Z', by: 'logKAF', from: 'KAF', to: 'FTA', eq: 'POL-JP8', qty: 15000, notes: 'Fuel for exercise NORTHERN LANTERN phase 2.', status: 'PENDING' },
-  // Raised in error and withdrawn before approval.
   { at: '2026-09-24T08:30:00Z', by: 'logFTA', from: 'FTA', to: 'CHW', eq: 'MED-CAT', qty: 40, notes: 'Duplicate of an earlier request.', status: 'CANCELLED', cancelReason: 'Raised in error: duplicate request.' },
-];
+] : [];
 
-const ASSIGNMENTS = [
+const ASSIGNMENTS = SEED_OPERATIONS ? [
   { key: 'a01', at: '2026-07-12T08:00:00Z', by: 'cmdrFTA', base: 'FTA', eq: 'WPN-M4A1', assignee: 'Sgt. James Walker', serviceNo: 'DEV-P-20417', unit: '1st Platoon, A Company', purpose: 'Individual weapon issue', expectedReturn: '2026-08-31T00:00:00Z' },
   { key: 'a02', at: '2026-07-12T08:10:00Z', by: 'cmdrFTA', base: 'FTA', eq: 'WPN-M17', assignee: 'Lt. Hannah Ortiz', serviceNo: 'DEV-P-20388', unit: 'A Company HQ', purpose: 'Officer sidearm issue' },
   { key: 'a03', at: '2026-07-20T06:30:00Z', by: 'cmdrFTA', base: 'FTA', eq: 'AMM-556', qty: 2400, assignee: 'SSgt. Victor Alvarez', serviceNo: 'DEV-P-20502', unit: 'Range Detail, B Company', purpose: 'Rifle qualification range', expectedReturn: '2026-07-23T18:00:00Z' },
@@ -147,16 +150,16 @@ const ASSIGNMENTS = [
   { key: 'a09', at: '2026-09-14T06:00:00Z', by: 'cmdrFTA', base: 'FTA', eq: 'VEH-JLTV', assignee: 'SFC Grace Kim', serviceNo: 'DEV-P-20611', unit: 'Scout Platoon', purpose: 'Reconnaissance training rotation', expectedReturn: '2026-10-30T00:00:00Z' },
   { key: 'a10', at: '2026-09-18T08:45:00Z', by: 'cmdrFTA', base: 'FTA', eq: 'COM-BA5590', qty: 40, assignee: 'SSgt. Mark Ellison', serviceNo: 'DEV-P-20655', unit: 'Signal Section', purpose: 'Radio power for field exercise' },
   { key: 'a11', at: '2026-09-22T07:30:00Z', by: 'cmdrKAF', base: 'KAF', eq: 'WPN-M4A1', assignee: 'Sgt. Tyler Brooks', serviceNo: 'DEV-P-40103', unit: 'Airfield Guard Force', purpose: 'Guard force weapon issue' },
-];
+] : [];
 
-const RETURNS = [
+const RETURNS = SEED_OPERATIONS ? [
   { at: '2026-07-23T17:30:00Z', by: 'cmdrFTA', assignment: 'a03', qty: 600, notes: 'Unused rounds returned to ammunition supply point.' },
   { at: '2026-08-20T15:00:00Z', by: 'cmdrFTA', assignment: 'a01', notes: 'Weapon returned after cleaning inspection.' },
   { at: '2026-09-01T16:00:00Z', by: 'cmdrCHW', assignment: 'a05', notes: 'Radio returned; minor antenna wear.' },
   { at: '2026-09-10T11:00:00Z', by: 'cmdrKAF', assignment: 'a07', qty: 5, notes: 'Surplus kits returned from aid station 3.' },
-];
+] : [];
 
-const EXPENDITURES = [
+const EXPENDITURES = SEED_OPERATIONS ? [
   { at: '2026-07-22T16:00:00Z', by: 'cmdrFTA', assignment: 'a03', qty: 1800, reason: 'TRAINING', notes: 'Rifle qualification, 45 firers.' },
   { at: '2026-07-25T15:30:00Z', by: 'cmdrCHW', base: 'CHW', eq: 'AMM-556', qty: 5000, reason: 'TRAINING', notes: 'Company live-fire exercise.' },
   { at: '2026-08-06T18:00:00Z', by: 'cmdrKAF', base: 'KAF', eq: 'POL-JP8', qty: 18000, reason: 'OPERATION', notes: 'Aircraft and ground support refuelling, week 32.' },
@@ -170,7 +173,7 @@ const EXPENDITURES = [
   { at: '2026-09-26T12:00:00Z', by: 'cmdrFTA', assignment: 'a10', qty: 12, reason: 'OPERATION', notes: 'Batteries depleted during field exercise.' },
   { at: '2026-09-27T18:30:00Z', by: 'cmdrKAF', base: 'KAF', eq: 'POL-JP8', qty: 22000, reason: 'OPERATION', notes: 'Aircraft refuelling, week 39.' },
   { at: '2026-09-28T09:00:00Z', by: 'cmdrCHW', base: 'CHW', eq: 'WPN-M4A1', reason: 'LOST', notes: 'Lost during river-crossing exercise; investigation opened.' },
-];
+] : [];
 
 // ─────────────────────────────────────────────────────────────────────────────
 

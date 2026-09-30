@@ -19,6 +19,7 @@
     "db:reset": "prisma migrate reset",
     "db:seed": "prisma db seed",
     "db:reconcile": "node scripts/reconcile-inventory.js",
+    "db:clean-operations": "node scripts/clean-operations.js",
     "db:studio": "prisma studio"
   },
   "dependencies": {
