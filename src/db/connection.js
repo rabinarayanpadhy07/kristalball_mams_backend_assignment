@@ -32,6 +32,8 @@ export function connectionOptionsFromUrl(connectionString, { caPath, poolSize = 
     password: decodeURIComponent(url.password),
     ...(database === null ? {} : { database: database ?? url.pathname.replace(/^\//, '') }),
     connectionLimit: poolSize,
+    connectTimeout: Number(url.searchParams.get('connectTimeout') || 15000),
+    socketTimeout: Number(url.searchParams.get('socketTimeout') || 30000),
     // MySQL 8 caching_sha2_password over a non-TLS local connection needs the server key.
     allowPublicKeyRetrieval: url.searchParams.get('allowPublicKeyRetrieval') === 'true',
     // All DATETIME columns hold UTC. Pin the session zone so DB-side defaults
